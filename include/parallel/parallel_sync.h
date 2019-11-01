@@ -558,6 +558,189 @@ void pull_parallel_vector_data(const Communicator & comm,
 }
 
 
+
+template <typename MapToVectors, typename ActionFunctor, typename ReceiveContext>
+void
+push_parallel_packed_range(const Communicator & comm,
+                           const MapToVectors & data,
+                           ReceiveContext * receive_context,
+                           const ActionFunctor & act_on_data)
+{
+  // This function must be run on all processors at once
+  libmesh_parallel_only(comm);
+
+  // This function implements the "NBX" algorithm from
+  // https://htor.inf.ethz.ch/publications/img/hoefler-dsde-protocols.pdf
+
+  // This function only works for "flat" data that we can pre-size
+  // receive buffers for: a map to vectors-of-standard-types, not e.g.
+  // vectors-of-vectors.
+  //
+  // Trying to instantiate a StandardType<T> gives us a compiler error
+  // where otherwise we would have had a runtime error.
+  //
+  // Creating a StandardType<T> manually also saves our APIs from
+  // having to do a bunch of automatic creations later.
+  //
+  // This object will be free'd before all non-blocking communications
+  // complete, but the MPI standard for MPI_Type_free specifies "Any
+  // communication that is currently using this datatype will
+  // complete normally." so we're cool.
+
+  // We need to get a non-const version of the vector type
+  typedef decltype(data.begin()->second) vector_ref_type;
+  typedef typename std::remove_reference<vector_ref_type>::type vector_nonref_type;
+  typedef typename std::remove_const<vector_nonref_type>::type vector_nonconst_nonref_type;
+
+  // We need to get a non-const version of the type the vector is holding
+  typedef decltype(*data.begin()->second.begin()) ref_type;
+  typedef typename std::remove_reference<ref_type>::type nonref_type;
+  typedef typename std::remove_const<nonref_type>::type nonconst_nonref_type;
+
+  // We'll grab a tag so we can overlap request sends and receives
+  // without confusing one for the other
+  auto tag = comm.get_unique_tag();
+
+  MapToVectors received_data;
+
+  // Post all of the sends, non-blocking and synchronous
+
+  // Save off the old send_mode so we can restore it after this
+  auto old_send_mode = comm.send_mode();
+
+  // Set the sending to synchronous - this is so that we can know when
+  // the sends are complete
+  const_cast<Communicator &>(comm).send_mode(Communicator::SYNCHRONOUS);
+
+  // The send requests
+  std::list<Request> reqs;
+
+  for (auto & datapair : data)
+  {
+    processor_id_type destid = datapair.first;
+    auto & datum = datapair.second;
+
+    // Just act on data if the user requested a send-to-self
+    if (destid == comm.rank())
+      act_on_data(destid, datum);
+    else
+    {
+      Request sendreq;
+      // comm.send(destid, datum,/*datatype,*/ sendreq, tag);
+      comm.nonblocking_send_packed_range(destid, &datum, datum.begin(), datum.end(), sendreq, tag);
+      reqs.push_back(sendreq);
+    }
+  }
+
+  bool sends_complete = reqs.empty();
+  bool started_barrier = false;
+  Request barrier_request;
+
+  // Receive
+
+  // The pair of src_pid and requests
+  std::list<std::pair<unsigned int, std::shared_ptr<Request>>> receive_reqs;
+  auto current_request = std::make_shared<Request>();
+
+  std::map<processor_id_type, std::shared_ptr<vector_nonconst_nonref_type>> incoming_data;
+
+  unsigned int current_src_proc = 0;
+
+  // Keep looking for receives
+  while (true)
+  {
+    // Look for data from anywhere
+    current_src_proc = Parallel::any_source;
+
+    bool flag = false;
+
+    auto stat = comm.template packed_range_probe<nonconst_nonref_type>(current_src_proc, tag, flag);
+
+    current_src_proc = stat.source();
+
+    // Check if there is a message and start receiving it
+    if (flag)
+    {
+      auto req = std::make_shared<Parallel::Request>();
+      auto data_buffer = std::make_shared<vector_nonconst_nonref_type>();
+      nonconst_nonref_type * output_type;
+
+      comm.nonblocking_receive_packed_range(stat.source(),
+                                            receive_context,
+                                            std::back_inserter(*data_buffer),
+                                            output_type,
+                                            *req,
+                                            stat,
+                                            tag);
+
+      incoming_data[current_src_proc] = data_buffer;
+      receive_reqs.emplace_back(current_src_proc, req);
+    }
+
+    // Clean up outstanding receive requests
+    receive_reqs.remove_if([&act_on_data, &incoming_data](
+                               std::pair<unsigned int, std::shared_ptr<Request>> & pid_req_pair) {
+      auto & pid = pid_req_pair.first;
+      auto & req = pid_req_pair.second;
+
+      // If it's finished - let's act on it
+      if (req->test())
+      {
+        // Do any post-wait work
+        req->wait();
+
+        act_on_data(pid, *incoming_data[pid]);
+
+        // Don't need this data anymore
+        incoming_data.erase(pid);
+
+        // This removes it from the list
+        return true;
+      }
+
+      // Not finished yet
+      return false;
+    });
+
+    reqs.remove_if([](Request & req) {
+      if (req.test())
+      {
+        // Do Post-Wait work
+        req.wait();
+
+        return true;
+      }
+
+      // Not finished yet
+      return false;
+    });
+
+    // See if all of the sends are finished
+    if (reqs.empty())
+      sends_complete = true;
+
+    // If they've all completed then we can start the barrier
+    if (sends_complete && !started_barrier)
+    {
+      started_barrier = true;
+      comm.nonblocking_barrier(barrier_request);
+    }
+
+    // Must fully receive everything before being allowed to move on!
+    if (receive_reqs.empty())
+      // See if all proessors have finished all sends (i.e. _done_!)
+      if (started_barrier)
+        if (barrier_request.test())
+          break; // Done!
+  }
+
+  // Reset the send mode
+  const_cast<Communicator &>(comm).send_mode(old_send_mode);
+
+  comm.barrier();
+}
+
+
 } // namespace Parallel
 
 
