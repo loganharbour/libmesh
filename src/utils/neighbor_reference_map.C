@@ -19,7 +19,9 @@
 
 // Local Includes
 #include "libmesh/elem.h"
+#include "libmesh/node.h"
 #include "libmesh/fe_interface.h"
+#include "libmesh/fe_type.h"
 
 namespace libMesh
 {
@@ -33,24 +35,35 @@ NeighborReferenceMap::get_neighbor_points(const Elem * const elem,
                                           const Elem * const neighbor_side_elem)
 {
   libmesh_assert_equal_to(side_elem->type(), neighbor_side_elem->type());
-  libmesh_assert_equal_to(elem->level() == neighbor->level());
+  libmesh_assert_equal_to(elem->level(), neighbor->level());
 
+  // Numerical element type for indexing into _data
+  libmesh_assert_not_equal_to(elem->type(), INVALID_ELEM);
   const std::size_t elem_type = elem->type();
 
+  // Resize if we haven't seen this elem type yet
   if (_data.size() <= elem_type)
     _data.resize(elem_type + 1);
 
+  // Resize if we haven't seen this side index yet
   auto & elem_type_entry = _data[elem_type];
   if (elem_type_entry.size() <= side)
     elem_type_entry.resize(side + 1);
 
-  const auto neighbor_node0 = neighbor_side_elem->get_node_index(side_elem->node(0));
+  // The index on neighbor_side_elem of node 0 on side_elem
+  const auto neighbor_node0 = neighbor_side_elem->get_node_index(side_elem->node_ptr(0));
+  libmesh_assert_not_equal_to(neighbor_node0, invalid_uint);
+
+  // Resize if we haven't seen this node index yet
   auto & side_entry = elem_type_entry[side];
   if (side_entry.size() <= neighbor_node0)
     side_entry.resize(neighbor_node0 + 1);
 
+  // The neighbor points
   auto & neighbor_points = side_entry[neighbor_node0];
-  if (neighbor_points.empty()) // have to generate ref points
+
+  // Empty means we haven't generated them yet so generate
+  if (neighbor_points.empty())
     FEInterface::inverse_map(elem->dim(), FEType(), neighbor, points, neighbor_points);
 
   libmesh_assert_equal_to(neighbor_points.size(), points.size());

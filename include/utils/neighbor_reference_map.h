@@ -46,10 +46,11 @@ public:
   const std::vector<Point> & get_neighbor_points(const Elem * const elem,
                                                  const unsigned int side,
                                                  const Elem * const side_elem,
-                                                 const std::vector<Point> & reference_points,
+                                                 const std::vector<Point> & points,
+                                                 const Elem * const neighbor,
                                                  const Elem * const neighbor_side_elem);
 
-  void clear() { _vec.clear(); }
+  void clear() { _data.clear(); }
 
 private:
   std::vector<std::vector<std::vector<std::vector<Point>>>> _data;
