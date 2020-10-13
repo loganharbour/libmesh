@@ -21,15 +21,9 @@
 
 #include "libmesh/elem.h"
 #include "libmesh/remote_elem.h"
-#ifdef LIBMESH_ENABLE_PERIODIC
-#include "libmesh/periodic_boundaries.h"
-#include "libmesh/boundary_info.h"
-#endif
 
 // C++ Includes
 #include <unordered_set>
-#include <set>
-#include <vector>
 
 namespace libMesh
 {
@@ -41,32 +35,11 @@ void GhostPointNeighbors::operator()
    GhostPointNeighbors::map_type & coupled_elements)
 {
   libmesh_assert(_mesh);
-
-#ifdef LIBMESH_ENABLE_PERIODIC
-  bool check_periodic_bcs =
-    (_periodic_bcs && !_periodic_bcs->empty());
-
-  std::unique_ptr<PointLocatorBase> point_locator;
-  if (check_periodic_bcs)
-      point_locator = _mesh->sub_point_locator();
-
-  std::set<const Elem *> periodic_elems_examined;
-  const BoundaryInfo & binfo = _mesh->get_boundary_info();
-  std::vector<boundary_id_type> appn_bcids;
-  std::vector<const Elem *> active_periodic_neighbors;
-#endif
-
-  // Using a connected_nodes set rather than point_neighbors() would
-  // give us correct results even in corner cases, such as where two
+  // Using the connected_nodes set rather than point_neighbors() gives
+  // us correct results even in corner cases, such as where two
   // elements meet only at a corner.  ;-)
-  //
-  // std::unordered_set<const Node *> connected_nodes;
-  //
-  // Unfortunately, it's not a *fast* enough test to use on a
-  // ReplicatedMesh (where it's O(Nprocs) times slower), or as a
-  // coupling functor (where it's O(Nelem/Nprocs) times slower), or as
-  // a coupling functor on a ReplicatedMesh (where you might as well
-  // just give up now)
+
+  std::unordered_set<const Node *> connected_nodes;
 
   // Links between boundary and interior elements on mixed
   // dimensional meshes also give us correct ghosting in this way.
@@ -93,104 +66,58 @@ void GhostPointNeighbors::operator()
       if (elem->processor_id() != p)
         coupled_elements.emplace(elem, nullcm);
 
-      std::set<const Elem *> elem_point_neighbors;
-      elem->find_point_neighbors(elem_point_neighbors);
-
-      for (const auto & neigh : elem_point_neighbors)
-        coupled_elements.emplace(neigh, nullcm);
-
-      // An interior_parent isn't on the same manifold so won't be
-      // found as a point neighbor, and it may not share nodes so we
-      // can't use a connected_nodes test.
-      //
-      // Trying to preserve interior_parent() only works if it's on
-      // the same Mesh, which is *not* guaranteed!  So we'll
-      // double-check.
-      const Elem * ip = elem->interior_parent();
-      if (ip && ip->processor_id() != p &&
-          _mesh->query_elem_ptr(ip->id()) == ip)
-        coupled_elements.emplace(ip, nullcm);
-
-#ifdef LIBMESH_ENABLE_PERIODIC
-      if (check_periodic_bcs)
+      for (auto neigh : elem->neighbor_ptr_range())
         {
-          for (const auto s : elem->side_index_range())
+          if (neigh && neigh != remote_elem)
             {
-              if (elem->neighbor_ptr(s))
-                continue;
-
-              const Elem * const equal_level_periodic_neigh = elem->topological_neighbor
-                (s, *_mesh, *point_locator, _periodic_bcs);
-
-              if (!equal_level_periodic_neigh || equal_level_periodic_neigh == remote_elem)
-                continue;
-
-              equal_level_periodic_neigh->active_family_tree_by_topological_neighbor(
-                active_periodic_neighbors,
-                elem,
-                *_mesh,
-                *point_locator,
-                _periodic_bcs,
-                /*reset=*/true);
-
-              for (const Elem * const active_periodic_neigh : active_periodic_neighbors)
+#ifdef LIBMESH_ENABLE_AMR
+              if (!neigh->active())
                 {
-                  std::set <const Elem *> active_periodic_point_neighbors;
+                  std::vector<const Elem*> family;
+                  neigh->active_family_tree_by_neighbor(family, elem);
 
-                  // This fills point neighbors *including*
-                  // active_periodic_neigh. The documentation for this method
-                  // states that this will return *active* point neighbors
-                  active_periodic_neigh->find_point_neighbors(active_periodic_point_neighbors);
-
-                  for (const Elem * const appn : active_periodic_point_neighbors)
-                    {
-                      // Don't need to ghost RemoteElem or an element we already own or an
-                      // element we've already examined
-                      if (appn == remote_elem || appn->processor_id() == p ||
-                          periodic_elems_examined.count(appn))
-                        continue;
-
-                      // We only need to keep point neighbors that are along the periodic boundaries
-                      bool on_periodic_boundary = false;
-                      for (const auto appn_s : appn->side_index_range())
-                        {
-                          binfo.boundary_ids(appn, appn_s, appn_bcids);
-                          for (const auto appn_bcid : appn_bcids)
-                            if (_periodic_bcs->find(appn_bcid) != _periodic_bcs->end())
-                              {
-                                on_periodic_boundary = true;
-                                goto jump;
-                              }
-                        }
-                      jump:
-                        if (on_periodic_boundary)
-                          coupled_elements.emplace(appn, nullcm);
-
-                        periodic_elems_examined.insert(appn);
-                    }
+                  for (const Elem * f : family)
+                    if (f->processor_id() != p)
+                      coupled_elements.emplace(f, nullcm);
                 }
+              else
+#endif
+                if (neigh->processor_id() != p)
+                  coupled_elements.emplace(neigh, nullcm);
             }
         }
-#endif // LIBMESH_ENABLE_PERIODIC
+
+      // It is possible that a refined boundary element will not
+      // touch any nodes of its interior_parent, in TRI3/TET4 and in
+      // non-level-one rule cases.  So we can't just rely on node
+      // connections to preserve interior_parent().  However, trying
+      // to preserve interior_parent() manually only works if it's on
+      // the same Mesh, which is *not* guaranteed!  So we'll
+      // double-check later to make sure our interior parents are in
+      // the mesh before we connect them.
+      if (elem->dim() < LIBMESH_DIM &&
+          elem->interior_parent() &&
+          elem->interior_parent()->processor_id() != p)
+        interior_parents.insert (elem->interior_parent());
+
+      // Add nodes connected to active local elements
+      for (auto n : elem->node_index_range())
+        connected_nodes.insert (elem->node_ptr(n));
     }
-}
 
-void GhostPointNeighbors::mesh_reinit()
-{
-  // Unless we have periodic boundary conditions, we don't need
-  // anything precomputed.
-#ifdef LIBMESH_ENABLE_PERIODIC
-  if (!_periodic_bcs || _periodic_bcs->empty())
-    return;
-#endif
+  // Connect any interior_parents who are really in our mesh
+  for (const auto & elem : interior_parents)
+    if (_mesh->query_elem_ptr(elem->id()) == elem)
+      coupled_elements.emplace(elem, nullcm);
 
-  // If we do have periodic boundary conditions, we'll need a master
-  // point locator, so we'd better have a mesh to build it on.
-  libmesh_assert(_mesh);
-
-  // Make sure an up-to-date master point locator has been
-  // constructed; we'll need to grab sub-locators soon.
-  _mesh->sub_point_locator();
+  // Connect any active elements which are connected to our range's
+  // elements' nodes by addin elements connected to nodes on active
+  // local elements.
+  for (const auto & elem : _mesh->active_element_ptr_range())
+    if (elem->processor_id() != p)
+      for (auto & n : elem->node_ref_range())
+        if (connected_nodes.count(&n))
+          coupled_elements.emplace(elem, nullcm);
 }
 
 } // namespace libMesh
