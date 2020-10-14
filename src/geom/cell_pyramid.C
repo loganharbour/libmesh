@@ -219,5 +219,15 @@ std::vector<unsigned int> Pyramid::sides_on_edge(const unsigned int e) const
 }
 
 
+bool Pyramid::contains_point (const Point & p, Real tol) const
+{
+  // At the Pyramid apex (node 4), the Jacobian is singular which will result
+  // in a false return from Elem::point_test, therefore check this first
+  if (node_ref(4).absolute_fuzzy_equals(p, tol))
+    return true;
+
+  return Elem::contains_point(p, tol);
+}
+
 
 } // namespace libMesh
