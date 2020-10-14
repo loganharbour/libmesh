@@ -151,6 +151,8 @@ public:
 
   virtual std::vector<unsigned int> sides_on_edge(const unsigned int e) const override final;
 
+  bool contains_point (const Point & p, Real tol=TOLERANCE) const override;
+
 protected:
 
   /**
